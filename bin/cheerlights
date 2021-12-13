@@ -1,0 +1,482 @@
+#!/bin/bash
+
+# Cheerlights
+#
+# Copyright Tarim 2013,2014,2015,2016,2017,2018,2019,2021
+#
+# Cheerlights is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Cheerlights is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Cheerlights.  If not, see <http://www.gnu.org/licenses/>.
+
+CheerlightsURL="http://api.thingspeak.com/channels/1417/field/1/last.txt"
+CheerlightsMQTT="mqtt.cheerlights.com"
+CheerlightsTopic="cheerlights"
+
+Prefix="cmd_"
+shopt -s nullglob
+Me=$(basename $0)
+PGIDFile="/tmp/${Me}.pgid"
+
+MQTTCmd="${MQTTCmd:-mosquitto_sub}"
+HTTPCmd="${HTTPCmd:-wget -q -O-}"
+STTYCmd="${STTYCmd:-stty -F}"
+
+
+# cmd_start [--mqtt] [--http] [--server SERVER] [--topic TOPIC] [--delay DELAY] [--deep] [--channel CHANNEL] [--device DEVICE] [--baud BAUD] [--log LOG_FILE]
+#
+# Run http or mqtt listener and send it to Enttec device
+#
+# SERVER    MQTT or HTTP server
+# TOPIC     MQTT topic
+# DELAY     Delay (secs) between polling HTTP server (10)
+# CHANNEL   DMX start channel (1)
+# DEVICE    Enttec style serial port
+# BAUD      Serial port speed (115200)
+# LOG_FILE  Log to here or stdout if empty
+# FILTER    Filter colours
+#
+cmd_start() {
+    local Protocol
+    local Server
+    local Arg
+    local Channel
+    local Device
+    local Baud
+    local Filter
+
+    while [ "${#*}" -gt 0 ]; do
+        case "${1}" in
+        --server | -server | -s)
+            Server="${2}"
+            shift
+            ;;
+
+        --http | -h)
+            Protocol="http"
+            ;;
+
+        --mqtt | -m)
+            Protocol="mqtt"
+            ;;
+
+        --fifo | -f)
+            Protocol="fifo"
+            ;;
+
+        --topic | -topic | -t | --delay | -delay)
+            [ -n "${Arg}" ] && err 'Multiple topic/delay specified'
+            Arg="${2}"
+            shift
+            ;;
+
+        --channel | -channel | -c)
+            Channel="${2}"
+            check_numeric "${Channel}" || err "Channel must be numeric"
+            shift
+            ;;
+
+        --device | -device | -d)
+            Device="${2}"
+            shift
+            ;;
+
+        --baud | -baud | -b)
+            Baud="${2}"
+            check_numeric "${Baud}" || err "Baud must be numeric"
+            shift
+            ;;
+
+        --log | -log | -l)
+            export LogFile="${2}"
+            shift
+            ;;
+
+        --deep | -deep)
+            Filter="${Filter}${Filter:+ }deep"
+            ;;
+
+        *)
+            err "Unknown option ${1}"
+            ;;
+        esac
+
+        shift
+    done
+
+    [ -n "${Protocol}" ] || {
+        case "${Server}" in
+        *http*)
+            Protocol="http"
+            ;;
+
+        *mqtt*)
+            Protocol="mqtt"
+            ;;
+
+        *fifo*)
+            Protocol="fifo"
+            [ -p "${Server}" ] || err "Not a named pipe" 1>&2
+            ;;
+
+        *)
+            if executable ${MQTTCmd}; then
+                Protocol="mqtt"
+            else
+                Protocol="http"
+            fi
+            ;;
+        esac
+    }
+
+    session -watchdog "${PGIDFile}" "$0" "run" "${Protocol}" "${Server}" "${Arg}" "${Filter}" "${Channel}" "${Device}" "${Baud}"
+}
+
+
+# cmd_status
+# Status of daemon
+# If running gives a list of the processes, otherwise says, "Not running"
+#
+cmd_status() {
+    session -status "${PGIDFile}" || {
+        echo "Not running"
+        return 1
+    }
+}
+
+
+# cmd_stop
+# Stop daemon
+#
+cmd_stop() {
+    session -kill -sigint "${PGIDFile}"
+    sleep 1
+    session -kill "${PGIDFile}"
+
+    cmd_cleanup
+}
+
+
+# cleanup [TIME]
+#
+cmd_cleanup() {
+    echo "${Me}: cleanup"
+
+    [ -n "$1" ] && {
+        sleep ${1}
+        echo "${Me}: respawn"
+    }
+}
+
+
+
+# cmd_httpget URL
+# Get the current colour with wget
+#
+cmd_httpget() {
+    ${HTTPCmd} "${1}"
+    echo ""
+}
+
+
+
+# cmd_mqttget MQTT_SERVER TOPIC
+# Listen on mqtt
+#
+cmd_mqttget() {
+    ${MQTTCmd} -h "${1}" -t "${2}"
+}
+
+
+
+# cmd_fifoget FILENAME
+# Listen to named pipe
+#
+cmd_fifoget() {
+    while :; do
+        cat "${1}"
+    done
+}
+
+
+
+# cmd_listen PROTOCOL SERVER [TOPIC|DELAY]
+# listen to message source
+#
+cmd_listen() {
+    local Protocol="${1}"
+    local Server="${2}"
+    local Arg="${3}"
+
+    case "${Protocol}" in
+    http)
+        Server="${Server:-${CheerlightsURL}}"
+        log "HTTP ${Server}"
+
+        while :; do
+            cmd_httpget "${Server}"
+            sleep "${Arg:-10}"
+        done
+        ;;
+
+    mqtt)
+        Server="${Server:-${CheerlightsMQTT}}"
+        local Topic="${Arg:-${CheerlightsTopic}}"
+        log "MQTT ${Server}/${Topic}"
+
+        cmd_mqttget "${Server}" "${Topic}"
+        ;;
+
+    fifo)
+        log "FIFO ${Server}"
+        cmd_fifoget "${Server}"
+        ;;
+
+    *)
+        err "Unknown protocol"
+        ;;
+    esac
+}
+
+
+
+# cmd_send [CHANNEL] [SERIAL [BAUD]]
+# Send hex on stdin to serial port
+#
+cmd_send() {
+    local Channel="1"
+    if check_numeric "${1}"; then
+        Channel="${1}"
+        shift
+    fi
+
+    local Device="${1}"
+    local Baud="${2:-115200}"
+
+    [ -n "${Device}" ] && {
+        $STTYCmd "${Device}" "${Baud}" raw -echo -echoe -echok -echoctl -echoke
+        sleep 3
+    }
+
+    local Hex
+    local Chans
+    local Prefix
+    local Skip
+
+    while
+        read Hex &&
+        [ -z "${Device}" -o -w "${Device}" ]
+    do
+        log "RGB ${Hex}"
+        Hex="${Hex###}"
+        Chans=$(( ${#Hex}/2 + Channel ))
+        printf -v Prefix '\\x7e\\x06\\x%02x\\x%02x' "$((Chans%256))" "$((Chans/256))"
+        {
+            echo -ne "${Prefix}"
+
+            Skip="${Channel}"
+            while [ $((Skip--)) -gt 0 ]; do
+                echo -ne "\x00"
+            done
+
+            while [ -n "${Hex}" ]; do
+                echo -ne "\x${Hex:0:2}"
+                Hex="${Hex:2}"
+            done
+
+            echo -ne "\xe7"
+        } |
+        if [ -n "${Device}" ]; then
+            cat >"${Device}"
+        else
+            od -c
+        fi
+    done
+
+    log "SEND done"
+    [ -n "${OpenPID}" ] && kill "${OpenPID}"
+}
+
+
+
+# cmd_run PROTOCOL SERVER (TOPIC|DELAY) FILTER CHANNEL DEVICE BAUD
+# run everything
+#
+cmd_run() {
+    local Protocol="${1}"
+    local Server="${2}"
+    local Arg="${3}"
+    local Filter="${4}"
+    local Channel="${5}"
+    local Device="${6}"
+    local Baud="${7}"
+
+    [ -n "${Device}" ] && {
+        cat < "${Device}" 1>&2
+        log "DEV ${Device} gone"
+        kill "$$"
+        exit 1
+    } &
+
+    set -e
+    set -o pipefail
+
+    cmd_listen "${Protocol}" "${Server}" "${Arg}" |
+    cmd_filter "${Filter}" |
+    cmd_send "${Channel}" "${Device}" "${Baud}"
+}
+
+
+
+# cmd_filter [deep]
+# Filter colour names
+#
+cmd_filter() {
+    local Flag="${1}"
+
+    local clr_red='#FF0000'
+    local clr_green='#008000'
+    local clr_blue='#0000FF'
+    local clr_cyan='#00FFFF'
+    local clr_white='#FFFFFF'
+    local clr_oldlace='#FDF5E6'
+    local clr_purple='#800080'
+    local clr_magenta='#FF00FF'
+    local clr_yellow='#FFFF00'
+    local clr_orange='#FFA500'
+    local clr_pink='#FFC0CB'
+
+    case "${Flag}" in
+    *deep)
+        clr_green='#00ff00'
+        clr_purple='#3000ff'
+        clr_orange='#FF4500'
+        clr_pink='#FF0011'
+    esac
+
+    local Line
+    local Tmp
+    while read Line; do
+        [[ "X${Line}" =~ ^X#*[0-9a-fA-F]*$ ]] || {
+            log "TINT ${Line}"
+            Tmp="clr_${Line}"
+            Tmp="${!Tmp}" 2>/dev/null
+            [ -n "${Tmp}" ] && Line="${Tmp}"
+        }
+
+        echo "${Line}"
+    done
+}
+
+
+
+# test
+# test code
+#
+cmd_test() {
+    echo testing...
+}
+
+
+# log MESSAGE
+# log message to file or stdout if LogFile blank
+#
+log() {
+    local Message="$(date '+%F %T') ${*}"
+    if [ -n "${LogFile}" ]; then
+        echo "${Message}" >> "${LogFile}"
+    else
+        echo "${Message}" 1>&2
+    fi
+}
+
+
+# err MESSAGE
+# echo an error and exit
+#
+err() {
+    echo "$*" 1>&2
+    exit 1
+}
+
+# executable PROGRAM
+# check if it's runable
+#
+executable() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# check_numeric NUMBER
+# check argument contains only digits
+#
+check_numeric() {
+    [[ "X${1}" =~ ^X[0-9]+$ ]]
+}
+
+# cmd_help [COMMAND | all]
+# Help
+#
+cmd_help() {
+    local Pattern
+    case "$1" in
+    "")
+        Pattern="/^# ${Prefix}/"
+        ;;
+    "all")
+        Pattern="/^# ${Prefix}/,/^${Prefix}/"
+        ;;
+    *)
+        Pattern="/^# ${Prefix}$1/,/^${Prefix}/"
+        ;;
+    esac
+
+    awk -v me="$(basename $0) " -v spacer="  " "
+        ${Pattern} {
+            if( sub( /^# ?/, spacer ) ) {
+                found=1
+                sub( /^ *${Prefix}/, me )
+                print
+            }
+        }
+        END {
+            if( !found ) exit(2)
+        }
+    " < "$0" || {
+        err "No help topic"
+    }
+}
+
+
+
+
+# main
+
+[ "X$1" = "X--test" ] && {
+    Test=echo
+    shift
+}
+
+case "$0" in
+*.cgi)
+    Cmd="${0##*/}"
+    ;;
+
+*)
+    if [ "$#" -eq 0 ]; then
+        Cmd="help"
+    else
+        Cmd="$1"
+        shift
+    fi
+    ;;
+esac
+
+"cmd_${Cmd}" "$@"
